@@ -27,56 +27,61 @@ def is_socket_closed(sock):
         sock.setblocking(1)
 
 def relay(src, dst, src_addr, dst_addr):
-    if is_socket_closed(src):
-        log(f"[!] Socket already closed before relay started from {src_addr}")
-        return
-
     try:
-        src.settimeout(1.0)
+        src.settimeout(1.0)  # Timeout setzen, damit recv nicht ewig blockiert
         while True:
             try:
                 data = src.recv(4096)
                 if not data:
                     log(f"[*] Connection closed by {src_addr}")
                     break
-                try:
-                    dst.sendall(data)
-                except (BrokenPipeError, OSError) as e:
-                    log(f"[!] Failed to send to {dst_addr}: {e}")
-                    break
+                dst.sendall(data)
             except socket.timeout:
-                continue
-            except Exception as e:
-                log(f"[!] Relay error from {src_addr} to {dst_addr}: {e}")
+                continue  # Timeout bedeutet: weiter warten
+            except OSError as e:
+                log(f"[!] OSError in relay from {src_addr} to {dst_addr}: {e}")
                 break
+    except Exception as e:
+        log(f"[!] Relay error between {src_addr} and {dst_addr}: {e}")
     finally:
-        for s in [src, dst]:
+        for s in (src, dst):
             try:
                 s.shutdown(socket.SHUT_RDWR)
-            except:
-                pass
-            try:
                 s.close()
             except:
                 pass
-
         with active_pairs_lock:
             to_remove = None
             for pair in active_pairs:
                 conns = (pair[0][0], pair[1][0])
                 addrs = (pair[0][1], pair[1][1])
-                if src_addr in addrs or dst_addr in addrs or src in conns or dst in conns:
+                if src_addr in addrs or dst_addr in addrs:
                     to_remove = pair
                     break
             if to_remove:
                 active_pairs.remove(to_remove)
-
         log(f"[*] Relay connection between {src_addr} and {dst_addr} closed")
 
 def pair_clients():
     while True:
-        client1 = waiting_clients.get()
-        client2 = waiting_clients.get()
+        client1 = None
+        client2 = None
+
+        # Erstes gültiges Paar finden
+        while not client1:
+            potential = waiting_clients.get()
+            if not is_socket_closed(potential[0]):
+                client1 = potential
+            else:
+                log(f"[*] Ignored closed socket {potential[1]} (client1)")
+
+        while not client2:
+            potential = waiting_clients.get()
+            if not is_socket_closed(potential[0]):
+                client2 = potential
+            else:
+                log(f"[*] Ignored closed socket {potential[1]} (client2)")
+
         with active_pairs_lock:
             active_pairs.append((client1, client2))
         log(f"[*] Pairing clients {client1[1]} <--> {client2[1]}")
