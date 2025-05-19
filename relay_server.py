@@ -3,7 +3,6 @@ import threading
 import os
 import queue
 import time
-import select
 
 HOST = '0.0.0.0'
 PORT = int(os.environ.get("PORT", 5001))
@@ -17,49 +16,52 @@ def log(message):
 
 def relay(src, dst, src_addr, dst_addr):
     try:
-        src.settimeout(1.0)  # Timeout für recv setzen, damit recv nicht ewig blockiert
+        try:
+            src.settimeout(1.0)  # Setze Timeout, um saubere Unterbrechung zu ermöglichen
+        except OSError:
+            log(f"[!] Cannot set timeout on closed socket from {src_addr}")
+            return
+
         while True:
             try:
                 data = src.recv(4096)
                 if not data:
                     log(f"[*] Connection closed by {src_addr}")
                     break
-                dst.sendall(data)
+                try:
+                    dst.sendall(data)
+                except (BrokenPipeError, OSError) as e:
+                    log(f"[!] Failed to send to {dst_addr}: {e}")
+                    break
             except socket.timeout:
-                # Timeout — prüfe ob Verbindung noch da ist
-                # Optionale Verbindungstest per select (oder Ping), hier einfach Loop fortsetzen
                 continue
             except Exception as e:
-                log(f"[!] Relay error between {src_addr} and {dst_addr}: {e}")
+                log(f"[!] Relay error from {src_addr} to {dst_addr}: {e}")
                 break
     finally:
-        try:
-            src.shutdown(socket.SHUT_RDWR)
-        except:
-            pass
-        try:
-            src.close()
-        except:
-            pass
-        try:
-            dst.shutdown(socket.SHUT_RDWR)
-        except:
-            pass
-        try:
-            dst.close()
-        except:
-            pass
+        # Schließe beide Sockets
+        for s in [src, dst]:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
+            try:
+                s.close()
+            except:
+                pass
 
-        # Entferne Paar aus active_pairs
+        # Entferne das Paar aus active_pairs
         with active_pairs_lock:
             to_remove = None
             for pair in active_pairs:
+                conns = (pair[0][0], pair[1][0])
                 addrs = (pair[0][1], pair[1][1])
-                if src_addr in addrs or dst_addr in addrs:
+                if src_addr in addrs or dst_addr in addrs or src in conns or dst in conns:
                     to_remove = pair
                     break
             if to_remove:
                 active_pairs.remove(to_remove)
+
         log(f"[*] Relay connection between {src_addr} and {dst_addr} closed")
 
 def pair_clients():
@@ -75,42 +77,8 @@ def pair_clients():
 
 def handle_client(conn, addr):
     log(f"[+] New client connected from {addr}")
-    conn.settimeout(1.0)
     waiting_clients.put((conn, addr))
     log(f"[*] Client {addr} is waiting for a partner...")
-
-    # Warte hier aktiv auf Verbindungsabbrüche
-    try:
-        while True:
-            try:
-                # Wenn Daten kommen, dann ignoriere - eigentlich keine Daten erwartet,
-                # Aber wenn recv == 0 oder Fehler => Verbindung weg
-                ready = select.select([conn], [], [], 1.0)
-                if ready[0]:
-                    data = conn.recv(1024)
-                    if not data:
-                        log(f"[*] Client {addr} disconnected")
-                        break
-                    # Ignoriere eventuelle Daten
-            except socket.timeout:
-                continue
-            except Exception as e:
-                log(f"[!] Error with client {addr}: {e}")
-                break
-    finally:
-        try:
-            conn.shutdown(socket.SHUT_RDWR)
-        except:
-            pass
-        try:
-            conn.close()
-        except:
-            pass
-        # Entferne evtl. aus waiting_clients falls noch da
-        with active_pairs_lock:
-            # Warteschlange kann nicht direkt durchsucht werden, aber vielleicht
-            # kannst du warten_clients neu aufbauen ohne diesen Client falls nötig
-            pass
 
 def main():
     threading.Thread(target=pair_clients, daemon=True).start()
