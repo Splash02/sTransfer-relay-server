@@ -14,14 +14,25 @@ active_pairs_lock = threading.Lock()
 def log(message):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}")
 
-def relay(src, dst, src_addr, dst_addr):
+def is_socket_closed(sock):
     try:
-        try:
-            src.settimeout(1.0)  # Setze Timeout, um saubere Unterbrechung zu ermöglichen
-        except OSError:
-            log(f"[!] Cannot set timeout on closed socket from {src_addr}")
-            return
+        sock.setblocking(0)
+        data = sock.recv(1, socket.MSG_PEEK)
+        return not data
+    except BlockingIOError:
+        return False
+    except OSError:
+        return True
+    finally:
+        sock.setblocking(1)
 
+def relay(src, dst, src_addr, dst_addr):
+    if is_socket_closed(src):
+        log(f"[!] Socket already closed before relay started from {src_addr}")
+        return
+
+    try:
+        src.settimeout(1.0)
         while True:
             try:
                 data = src.recv(4096)
@@ -39,7 +50,6 @@ def relay(src, dst, src_addr, dst_addr):
                 log(f"[!] Relay error from {src_addr} to {dst_addr}: {e}")
                 break
     finally:
-        # Schließe beide Sockets
         for s in [src, dst]:
             try:
                 s.shutdown(socket.SHUT_RDWR)
@@ -50,7 +60,6 @@ def relay(src, dst, src_addr, dst_addr):
             except:
                 pass
 
-        # Entferne das Paar aus active_pairs
         with active_pairs_lock:
             to_remove = None
             for pair in active_pairs:
