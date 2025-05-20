@@ -11,6 +11,7 @@ waiting_clients = queue.Queue()
 waiting_clients_list = [] 
 active_pairs = []
 active_pairs_lock = threading.Lock()
+waiting_lock = threading.Lock()
 
 DISCONNECT_MSG = b"__DISCONNECT__"
 
@@ -41,12 +42,19 @@ def relay(src, dst, src_addr, dst_addr):
 
 def pair_clients():
     while True:
-        client1, addr1 = waiting_clients.get()
-        client2, addr2 = waiting_clients.get()
+        with waiting_lock:
+            if waiting_clients.qsize() < 2:
+                time.sleep(0.1)
+                continue
+            client1, addr1 = waiting_clients.get()
+            client2, addr2 = waiting_clients.get()
 
-        # Check if clients are still connected
         if client1.fileno() == -1 or client2.fileno() == -1:
             log(f"[!] One of the clients disconnected before pairing. Skipping.")
+            try: client1.close()
+            except: pass
+            try: client2.close()
+            except: pass
             continue
 
         with active_pairs_lock:
@@ -58,8 +66,9 @@ def pair_clients():
 
 def handle_client(conn, addr):
     log(f"[+] Client connected from {addr}")
-    waiting_clients_list.append((conn, addr))
-    waiting_clients.put((conn, addr))
+    with waiting_lock:
+        waiting_clients.put((conn, addr))
+        waiting_clients_list.append((conn, addr))
     log(f"[*] Client {addr} added to waiting queue")
 
     try:
@@ -70,23 +79,24 @@ def handle_client(conn, addr):
                 break
             if data.startswith(DISCONNECT_MSG):
                 log(f"[*] Client {addr} sent DISCONNECT")
-
-                # Remove from queue if still waiting
                 removed = False
-                with waiting_clients.mutex:
-                    for i, (c, a) in enumerate(list(waiting_clients.queue)):
-                        if a == addr:
-                            del waiting_clients.queue[i]
+                with waiting_lock:
+                    tmp = queue.Queue()
+                    while not waiting_clients.empty():
+                        c, a = waiting_clients.get()
+                        if a != addr:
+                            tmp.put((c, a))
+                        else:
                             removed = True
-                            break
+                    while not tmp.empty():
+                        waiting_clients.put(tmp.get())
 
-                # Remove from list
-                for i, (c, a) in enumerate(waiting_clients_list):
-                    if a == addr:
-                        try: c.close()
-                        except: pass
-                        del waiting_clients_list[i]
-                        break
+                    for i, (c, a) in enumerate(waiting_clients_list):
+                        if a == addr:
+                            try: c.close()
+                            except: pass
+                            del waiting_clients_list[i]
+                            break
 
                 if removed:
                     log(f"[*] Client {addr} removed from waiting queue")
