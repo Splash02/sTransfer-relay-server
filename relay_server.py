@@ -10,105 +10,97 @@ PORT = int(os.environ.get("PORT", 5001))
 DISCONNECT_MSG = b"__DISCONNECT__"
 
 waiting_clients = queue.Queue()
-waiting_clients_list = []
+waiting_clients_lock = threading.Lock()
+waiting_clients_set = set()
 active_pairs = []
-lock = threading.Lock()
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
-def handle_relay(client_a, client_b, addr_a, addr_b):
-    def forward(src, dst, src_addr, dst_addr):
-        try:
-            while True:
-                data = src.recv(4096)
-                if not data or data.startswith(DISCONNECT_MSG):
-                    break
-                dst.sendall(data)
-        except Exception as e:
-            log(f"[!] Relay error {src_addr} → {dst_addr}: {e}")
-        finally:
-            try: src.shutdown(socket.SHUT_RDWR)
-            except: pass
-            try: src.close()
-            except: pass
-            try: dst.shutdown(socket.SHUT_RDWR)
-            except: pass
-            try: dst.close()
-            except: pass
-            log(f"[x] Connection closed: {src_addr} ↔ {dst_addr}")
-            with lock:
-                if (client_a, client_b) in active_pairs:
-                    active_pairs.remove((client_a, client_b))
-                elif (client_b, client_a) in active_pairs:
-                    active_pairs.remove((client_b, client_a))
+def close_socket(sock):
+    try: sock.shutdown(socket.SHUT_RDWR)
+    except: pass
+    try: sock.close()
+    except: pass
 
-    threading.Thread(target=forward, args=(client_a, client_b, addr_a, addr_b), daemon=True).start()
-    threading.Thread(target=forward, args=(client_b, client_a, addr_b, addr_a), daemon=True).start()
+def relay(src, dst, src_addr, dst_addr):
+    try:
+        while True:
+            data = src.recv(4096)
+            if not data or data.startswith(DISCONNECT_MSG):
+                break
+            dst.sendall(data)
+    except:
+        pass
+    finally:
+        close_socket(src)
+        close_socket(dst)
+        log(f"[x] Closed connection: {src_addr} ↔ {dst_addr}")
+        with waiting_clients_lock:
+            active_pairs[:] = [pair for pair in active_pairs if src not in pair and dst not in pair]
 
 def pair_clients_loop():
     while True:
-        client1, addr1 = waiting_clients.get()
-        client2, addr2 = waiting_clients.get()
-
+        with waiting_clients_lock:
+            if waiting_clients.qsize() < 2:
+                time.sleep(0.1)
+                continue
+            try:
+                client1, addr1 = waiting_clients.get_nowait()
+                client2, addr2 = waiting_clients.get_nowait()
+                waiting_clients_set.discard(addr1)
+                waiting_clients_set.discard(addr2)
+            except queue.Empty:
+                continue
 
         if client1.fileno() == -1 or client2.fileno() == -1:
             log(f"[!] Skipping disconnected client(s): {addr1}, {addr2}")
-            for c in (client1, client2):
-                try: c.close()
-                except: pass
+            close_socket(client1)
+            close_socket(client2)
             continue
 
-        with lock:
+        with waiting_clients_lock:
             active_pairs.append((client1, client2))
 
-        log(f"[+] Pairing: {addr1} ↔ {addr2}")
-        handle_relay(client1, client2, addr1, addr2)
+        log(f"[✓] Pairing: {addr1} ↔ {addr2}")
+        threading.Thread(target=relay, args=(client1, client2, addr1, addr2), daemon=True).start()
+        threading.Thread(target=relay, args=(client2, client1, addr2, addr1), daemon=True).start()
 
-def remove_from_waiting(addr):
-    with lock:
-
+def remove_client(addr, conn):
+    with waiting_clients_lock:
         tmp = queue.Queue()
         while not waiting_clients.empty():
-            c, a = waiting_clients.get()
+            sock, a = waiting_clients.get()
             if a != addr:
-                tmp.put((c, a))
+                tmp.put((sock, a))
             else:
-                try: c.close()
-                except: pass
+                close_socket(sock)
+                waiting_clients_set.discard(addr)
         while not tmp.empty():
             waiting_clients.put(tmp.get())
-
-
-        for i, (c, a) in enumerate(waiting_clients_list):
-            if a == addr:
-                try: c.close()
-                except: pass
-                del waiting_clients_list[i]
-                break
+    close_socket(conn)
 
 def client_thread(conn, addr):
     log(f"[+] New client: {addr}")
-
-    with lock:
-        waiting_clients.put((conn, addr))
-        waiting_clients_list.append((conn, addr))
+    with waiting_clients_lock:
+        if addr not in waiting_clients_set:
+            waiting_clients.put((conn, addr))
+            waiting_clients_set.add(addr)
 
     try:
         while True:
             data = conn.recv(4096)
             if not data:
-                log(f"[!] {addr} disconnected unexpectedly")
+                log(f"[!] {addr} disconnected")
                 break
             if data.startswith(DISCONNECT_MSG):
                 log(f"[-] {addr} requested disconnect")
-                remove_from_waiting(addr)
-                break
+                remove_client(addr, conn)
+                return
     except Exception as e:
         log(f"[!] Error with {addr}: {e}")
     finally:
-        try: conn.close()
-        except: pass
+        remove_client(addr, conn)
 
 def start_server():
     threading.Thread(target=pair_clients_loop, daemon=True).start()
