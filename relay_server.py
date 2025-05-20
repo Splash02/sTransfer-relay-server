@@ -68,20 +68,29 @@ def monitor_disconnect(conn, addr):
                 break
             if data.startswith(DISCONNECT_MSG):
                 log(f"[*] {addr} actively disconnected")
-                conn.close()
-                # Aus Warteliste entfernen
+                try:
+                    global waiting_clients
+                    new_q = queue.Queue()
+                    while not waiting_clients.empty():
+                        item = waiting_clients.get()
+                        if item[1] != addr:
+                            new_q.put(item)
+                    waiting_clients = new_q
+                except Exception as e:
+                    log(f"[!] Failed to clean waiting queue: {e}")
+
                 for i, (sock, a) in enumerate(waiting_clients_list):
                     if a == addr:
+                        try: sock.close()
+                        except: pass
                         del waiting_clients_list[i]
                         break
                 return
     except:
         pass
     finally:
-        try:
-            conn.close()
-        except:
-            pass
+        try: conn.close()
+        except: pass
 
 def handle_client(conn, addr):
     log(f"[+] New client connected from {addr}")
