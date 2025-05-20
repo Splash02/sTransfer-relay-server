@@ -52,11 +52,37 @@ def relay(src, dst, src_addr, dst_addr):
             if to_remove:
                 active_pairs.remove(to_remove)
         log(f"[*] Relay connection between {src_addr} and {dst_addr} closed")
-
 def pair_clients():
     while True:
         client1 = waiting_clients.get()
-        client2 = waiting_clients.get()
+        try:
+            client2 = waiting_clients.get(timeout=10)
+        except queue.Empty:
+            try:
+                client1[0].send(b"")
+            except:
+                try:
+                    client1[0].close()
+                except:
+                    pass
+            else:
+                waiting_clients.put(client1)
+            continue
+
+        dead = False
+        for client in (client1, client2):
+            try:
+                client[0].send(b"")
+            except:
+                try:
+                    client[0].close()
+                except:
+                    pass
+                dead = True
+
+        if dead:
+            continue 
+
         with active_pairs_lock:
             active_pairs.append((client1, client2))
         log(f"[*] Pairing clients {client1[1]} <--> {client2[1]}")
