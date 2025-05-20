@@ -92,6 +92,27 @@ def pair_clients():
 
 def handle_client(conn, addr):
     log(f"[+] New client connected from {addr}")
+
+    conn.settimeout(3.0)
+    try:
+        peek = conn.recv(4096, socket.MSG_PEEK)
+        if peek.startswith(DISCONNECT_MSG):
+            conn.recv(len(DISCONNECT_MSG))
+            conn.close()
+            log(f"[*] Client {addr} disconnected before pairing")
+            return
+    except socket.timeout:
+        pass
+    except Exception as e:
+        log(f"[!] Error during initial check from {addr}: {e}")
+        try:
+            conn.close()
+        except:
+            pass
+        return
+    
+    conn.settimeout(None)
+
     waiting_clients.put((conn, addr))
     log(f"[*] Client {addr} is waiting for a partner...")
 
