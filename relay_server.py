@@ -10,17 +10,10 @@ BUFFER_SIZE = 4096
 
 waiting_clients = queue.Queue()
 active_pairs = []
-active_conns = {}  # addr -> conn
 lock = threading.Lock()
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}")
-
-def handle_client(conn, addr):
-    log(f"[+] Client connected: {addr}")
-    with lock:
-        active_conns[addr] = conn
-    waiting_clients.put((conn, addr))
 
 def relay_data(src, dst, src_addr, dst_addr):
     try:
@@ -29,11 +22,11 @@ def relay_data(src, dst, src_addr, dst_addr):
             if not data:
                 break
             if data == DISCONNECT_MSG:
-                log(f"[!] {src_addr} sent disconnect")
+                log(f"[!] {src_addr} disconnected")
                 break
             dst.sendall(data)
     except Exception as e:
-        log(f"[!] Relay error {src_addr} -> {dst_addr}: {e}")
+        log(f"[!] Relay error {src_addr}->{dst_addr}: {e}")
     finally:
         cleanup_pair(src, dst, src_addr, dst_addr)
 
@@ -43,38 +36,27 @@ def cleanup_pair(sock1, sock2, addr1, addr2):
     try: sock2.close()
     except: pass
     with lock:
-        active_pairs[:] = [pair for pair in active_pairs if addr1 not in pair and addr2 not in pair]
-        active_conns.pop(addr1, None)
-        active_conns.pop(addr2, None)
+        active_pairs[:] = [p for p in active_pairs if addr1 not in p and addr2 not in p]
     log(f"[-] Disconnected: {addr1} & {addr2}")
 
-def cleanup_single(sock, addr):
-    try: sock.close()
-    except: pass
-    with lock:
-        active_conns.pop(addr, None)
-    log(f"[-] Disconnected: {addr}")
+def handle_client(conn, addr):
+    log(f"[+] Client connected: {addr}")
+    waiting_clients.put((conn, addr))
 
 def match_clients():
     while True:
         conn1, addr1 = waiting_clients.get()
-        # Warte kurz, um Disconnects direkt nach Join abzufangen
         time.sleep(0.2)
         if conn1._closed:
-            cleanup_single(conn1, addr1)
             continue
-
         conn2, addr2 = waiting_clients.get()
         time.sleep(0.2)
         if conn2._closed:
-            cleanup_single(conn2, addr2)
             waiting_clients.put((conn1, addr1))
             continue
-
-        log(f"[=] Pairing {addr1} <-> {addr2}")
         with lock:
             active_pairs.append((addr1, addr2))
-
+        log(f"[=] Pairing {addr1} <-> {addr2}")
         threading.Thread(target=relay_data, args=(conn1, conn2, addr1, addr2), daemon=True).start()
         threading.Thread(target=relay_data, args=(conn2, conn1, addr2, addr1), daemon=True).start()
 
@@ -84,9 +66,7 @@ def main():
     server.bind((HOST, PORT))
     server.listen(10)
     log(f"[✓] Relay server listening on {HOST}:{PORT}")
-
     threading.Thread(target=match_clients, daemon=True).start()
-
     while True:
         conn, addr = server.accept()
         threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
