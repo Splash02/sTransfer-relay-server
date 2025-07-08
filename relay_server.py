@@ -1,23 +1,26 @@
-import socket, threading, queue, time
+import socket
+import threading
+import time
 
-HOST         = '0.0.0.0'
-PORT         = 5001
-CMD_JOIN     = b"JOIN\n"
-CMD_LEAVE    = b"LEAVE\n"
-BUFFER_SIZE  = 4096
+HOST        = '0.0.0.0'
+PORT        = 5001
+CMD_JOIN    = b"JOIN\n"
+CMD_LEAVE   = b"LEAVE\n"
+BUFFER_SIZE = 4096
 
-waiting = queue.Queue()
-active  = []
-lock    = threading.Lock()
+waiting_list = []        # Liste der wartenden Sockets
+active_pairs = []        # Liste der aktuell gepaarten Adressen
+lock = threading.Lock()
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
 def handle_client(conn, addr):
     """
-    Liest zuerst JOIN/LEAVE-Befehle, bevor es in die Pairing-Queue kommt.
+    1) Liest JOIN oder schließt bei anderem
+    2) Fügt JOIN-Socket zur waiting_list hinzu
+    3) Startet monitor, um LEAVE vor Pairing zu erkennen
     """
-    log(f"Client up: {addr}")
     try:
         line = b""
         while not line.endswith(b"\n"):
@@ -26,79 +29,111 @@ def handle_client(conn, addr):
                 conn.close()
                 return
             line += part
-        if line == CMD_JOIN:
-            waiting.put((conn, addr))
-            log(f"{addr} JOIN")
-            # Jetzt verbleibt der Socket in der Queue bis pairing
-        else:
+        if line != CMD_JOIN:
             conn.close()
+            return
+
+        with lock:
+            waiting_list.append((conn, addr))
+        log(f"{addr} JOIN → added to waiting_list")
+
+        # Monitor-Thread, um LEAVE vor dem Pairing zu erfassen
+        threading.Thread(target=monitor_waiting, args=(conn, addr), daemon=True).start()
+
+    except Exception as e:
+        log(f"handle_client error {addr}: {e}")
+        conn.close()
+
+def monitor_waiting(conn, addr):
+    """
+    Wartet auf LEAVE oder Socket-Close, **vor** Pairing.
+    Entfernt den Client aus waiting_list.
+    """
+    try:
+        while True:
+            data = conn.recv(BUFFER_SIZE)
+            if not data or data == CMD_LEAVE:
+                with lock:
+                    # entferne alle Einträge mit dieser conn
+                    waiting_list[:] = [(c,a) for c,a in waiting_list if c is not conn]
+                log(f"{addr} LEAVE before pairing → removed from waiting_list")
+                conn.close()
+                return
+            # sonst ignorieren (z.B. Datei-Daten nach Pairing)
     except:
-        pass
+        with lock:
+            waiting_list[:] = [(c,a) for c,a in waiting_list if c is not conn]
+        log(f"{addr} disconnected before pairing")
+        try: conn.close()
+        except: pass
 
 def is_closed(conn):
     try:
         conn.settimeout(0.01)
-        data = conn.recv(1, socket.MSG_PEEK)
+        _ = conn.recv(1, socket.MSG_PEEK)
         conn.settimeout(None)
         return False
     except:
         conn.settimeout(None)
         return True
 
-def relay(a, b, addr_a, addr_b):
+def relay(src, dst, addr_src, addr_dst):
     """
-    Relay loop: bricht bei LEAVE oder Socket-Close ab.
+    Relay-Loop: bricht bei LEAVE oder Verbindungsende ab.
     """
     try:
         while True:
-            data = a.recv(BUFFER_SIZE)
+            data = src.recv(BUFFER_SIZE)
             if not data or data == CMD_LEAVE:
-                log(f"{addr_a} LEAVE")
+                log(f"{addr_src} LEAVE during transfer")
                 break
-            b.sendall(data)
+            dst.sendall(data)
     except Exception as e:
-        log(f"Error {addr_a}->{addr_b}: {e}")
+        log(f"Relay error {addr_src}->{addr_dst}: {e}")
     finally:
-        cleanup(a,b,addr_a,addr_b)
+        cleanup(src, dst, addr_src, addr_dst)
 
-def cleanup(a,b,addr_a,addr_b):
-    for s in (a,b): 
+def cleanup(a, b, addr_a, addr_b):
+    for s in (a, b):
         try: s.close()
         except: pass
     with lock:
-        active[:] = [p for p in active if addr_a not in p and addr_b not in p]
-    log(f"Cleanup {addr_a} & {addr_b}")
+        active_pairs[:] = [p for p in active_pairs if addr_a not in p and addr_b not in p]
+    log(f"Cleaned up pair {addr_a} & {addr_b}")
 
 def matcher():
+    """
+    Polling-Matcher: sobald zwei wartende Sockets verfügbar,
+    werden sie gepaart.
+    """
     while True:
-        conn1, addr1 = waiting.get()
-        # wenn Client schon gone, skip
-        if is_closed(conn1):
-            log(f"Skipping closed {addr1}")
-            continue
-
-        conn2, addr2 = waiting.get()
-        if is_closed(conn2):
-            waiting.put((conn1, addr1))
-            log(f"Skipping closed {addr2}")
-            continue
-
         with lock:
-            active.append((addr1, addr2))
-        log(f"Pairing {addr1} <-> {addr2}")
-        threading.Thread(target=relay, args=(conn1,conn2,addr1,addr2), daemon=True).start()
-        threading.Thread(target=relay, args=(conn2,conn1,addr2,addr1), daemon=True).start()
+            # Filter geschlossene Sockets heraus
+            waiting_list[:] = [(c,a) for c,a in waiting_list if not is_closed(c)]
+            if len(waiting_list) < 2:
+                # nichts zu tun
+                pass
+            else:
+                (c1,a1), (c2,a2) = waiting_list.pop(0), waiting_list.pop(0)
+                active_pairs.append((a1,a2))
+                log(f"Pairing {a1} <-> {a2}")
+                # Starte Relay in beide Richtungen
+                threading.Thread(target=relay, args=(c1,c2,a1,a2), daemon=True).start()
+                threading.Thread(target=relay, args=(c2,c1,a2,a1), daemon=True).start()
+        time.sleep(0.1)
 
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1)
-    server.bind((HOST,PORT))
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
     server.listen(10)
     log(f"Relay listening on {HOST}:{PORT}")
+
     threading.Thread(target=matcher, daemon=True).start()
+
     while True:
         conn, addr = server.accept()
-        threading.Thread(target=handle_client, args=(conn,addr), daemon=True).start()
+        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
