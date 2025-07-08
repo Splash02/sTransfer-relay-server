@@ -15,6 +15,18 @@ lock = threading.Lock()
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
+def is_alive(conn):
+    try:
+        conn.settimeout(0.1)
+        data = conn.recv(1, socket.MSG_PEEK)
+        conn.settimeout(None)
+        return True
+    except (BlockingIOError, socket.timeout):
+        conn.settimeout(None)
+        return True
+    except:
+        return False
+
 def relay_data(src, dst, src_addr, dst_addr):
     try:
         while True:
@@ -46,16 +58,22 @@ def handle_client(conn, addr):
 def match_clients():
     while True:
         conn1, addr1 = waiting_clients.get()
-        time.sleep(0.2)
-        if conn1._closed:
+
+        if not is_alive(conn1):
+            log(f"[x] Dead socket removed: {addr1}")
             continue
+
+        time.sleep(0.2)
         conn2, addr2 = waiting_clients.get()
-        time.sleep(0.2)
-        if conn2._closed:
-            waiting_clients.put((conn1, addr1))
+
+        if not is_alive(conn2):
+            log(f"[x] Dead socket removed: {addr2}")
+            waiting_clients.put((conn1, addr1))  # conn1 wieder in Queue
             continue
+
         with lock:
             active_pairs.append((addr1, addr2))
+
         log(f"[=] Pairing {addr1} <-> {addr2}")
         threading.Thread(target=relay_data, args=(conn1, conn2, addr1, addr2), daemon=True).start()
         threading.Thread(target=relay_data, args=(conn2, conn1, addr2, addr1), daemon=True).start()
