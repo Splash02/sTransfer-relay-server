@@ -2,13 +2,13 @@ import socket
 import threading
 import time
 
-HOST = "0.0.0.0"    # Hört auf allen Interfaces
+HOST = "0.0.0.0"
 PORT = 5001
 BUFFER_SIZE = 4096
 DISCONNECT_MSG = b"__DISCONNECT__"
 
 lock = threading.Lock()
-waiting = None  # Ein wartender Client, maximal ein Client in der Warteschlange
+waiting_clients = []  # Liste aller wartenden Clients
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}")
@@ -27,59 +27,72 @@ class Client:
         except:
             pass
 
-def handle_client(client: Client):
-    global waiting
-    conn, addr = client.conn, client.addr
+def monitor_waiting():
+    """Entfernt automatisch Clients aus waiting, die disconnected sind"""
+    global waiting_clients
+    while True:
+        with lock:
+            waiting_clients = [c for c in waiting_clients if c.alive]
+        time.sleep(0.2)
+
+def handle_client(conn, addr):
+    client = Client(conn, addr)
     try:
         while client.alive:
-            # Warte auf JOIN oder LEAVE Nachricht
             line = b""
             while not line.endswith(b"\n"):
                 part = conn.recv(1)
                 if not part:
-                    raise ConnectionResetError()
+                    client.close()
+                    break
                 line += part
-            line = line.strip()
-
-            if line == b"JOIN":
-                log(f"{addr} joined")
-                with lock:
-                    if waiting is None:
-                        waiting = client
-                        log(f"{addr} wartet auf Partner...")
-                    else:
-                        partner = waiting
-                        waiting = None
-                        client.partner = partner
-                        partner.partner = client
-                        # Starte Relay Threads für beide Richtungen
-                        threading.Thread(target=relay, args=(client, partner), daemon=True).start()
-                        threading.Thread(target=relay, args=(partner, client), daemon=True).start()
-                        log(f"Paired {addr} <-> {partner.addr}")
+            if not client.alive:
                 break
 
-            elif line == b"LEAVE":
+            cmd = line.strip()
+            if cmd == b"JOIN":
+                log(f"{addr} joined")
+                paired = False
+                with lock:
+                    # Prüfe, ob ein anderer wartender Client existiert
+                    for waiting in waiting_clients:
+                        if waiting.alive and waiting != client:
+                            # Pairing
+                            client.partner = waiting
+                            waiting.partner = client
+                            waiting_clients.remove(waiting)
+                            paired = True
+                            threading.Thread(target=relay, args=(client, waiting), daemon=True).start()
+                            threading.Thread(target=relay, args=(waiting, client), daemon=True).start()
+                            log(f"Paired {client.addr} <-> {waiting.addr}")
+                            break
+                    if not paired:
+                        waiting_clients.append(client)
+                        log(f"{client.addr} wartet auf Partner...")
+            elif cmd == b"LEAVE":
                 log(f"{addr} left before pairing")
                 client.close()
                 with lock:
-                    if waiting is client:
-                        waiting = None
+                    if client in waiting_clients:
+                        waiting_clients.remove(client)
                 break
-
             else:
-                log(f"{addr} sent unknown command: {line}")
+                log(f"{addr} sent unknown command: {cmd}")
                 client.close()
+                with lock:
+                    if client in waiting_clients:
+                        waiting_clients.remove(client)
                 break
-
     except Exception as e:
         log(f"Error {addr}: {e}")
+    finally:
         client.close()
         with lock:
-            if waiting is client:
-                waiting = None
+            if client in waiting_clients:
+                waiting_clients.remove(client)
 
 def relay(src: Client, dst: Client):
-    """Leitet Daten von src -> dst weiter, bis Disconnect oder EOF"""
+    """Leitet Daten von src -> dst weiter"""
     try:
         while src.alive and dst.alive:
             try:
@@ -103,6 +116,7 @@ def relay(src: Client, dst: Client):
             dst.close()
 
 def main():
+    threading.Thread(target=monitor_waiting, daemon=True).start()
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((HOST, PORT))
@@ -111,8 +125,7 @@ def main():
 
     while True:
         conn, addr = srv.accept()
-        client = Client(conn, addr)
-        threading.Thread(target=handle_client, args=(client,), daemon=True).start()
+        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 
 if __name__ == "__main__":
     main()
