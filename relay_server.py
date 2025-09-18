@@ -23,8 +23,7 @@ class Client:
 
     def close(self):
         self.alive = False
-        try:
-            self.conn.close()
+        try: self.conn.close()
         except: pass
 
 def monitor_waiting():
@@ -44,8 +43,7 @@ def handle_client(conn, addr):
                     client.close()
                     break
                 line += part
-            if not client.alive:
-                break
+            if not client.alive: break
 
             cmd = line.strip()
             if cmd == b"JOIN":
@@ -69,66 +67,61 @@ def handle_client(conn, addr):
                             break
                     if not paired:
                         waiting_clients.append(client)
-                        try:
-                            client.conn.sendall(b"WAITING\n")
+                        try: client.conn.sendall(b"WAITING\n")
                         except: pass
                         log(f"{client.addr} wartet auf Partner...")
             elif cmd == b"LEAVE":
-                log(f"{addr} left before pairing")
+                log(f"{addr} left")
                 client.close()
                 with lock:
-                    if client in waiting_clients:
-                        waiting_clients.remove(client)
+                    if client in waiting_clients: waiting_clients.remove(client)
                 break
             else:
                 log(f"{addr} sent unknown command: {cmd}")
                 client.close()
                 with lock:
-                    if client in waiting_clients:
-                        waiting_clients.remove(client)
+                    if client in waiting_clients: waiting_clients.remove(client)
                 break
     except Exception as e:
         log(f"Error {addr}: {e}")
     finally:
         client.close()
         with lock:
-            if client in waiting_clients:
-                waiting_clients.remove(client)
+            if client in waiting_clients: waiting_clients.remove(client)
 
 def relay(src: Client, dst: Client):
+    """Nur für Datei-Transfer, keine Steuerbefehle!"""
     try:
         while src.alive and dst.alive:
+            # 4 Byte Header einlesen
+            hdr = src.conn.recv(4)
+            if not hdr: break
+            if hdr == DISCONNECT_MSG[:4]:
+                rest = src.conn.recv(len(DISCONNECT_MSG)-4)
+                if hdr+rest == DISCONNECT_MSG: break
+
+            # Header interpretiert als Länge des Meta
+            length = struct.unpack(">I", hdr)[0]
+            meta = src.conn.recv(length)
+            dst.conn.sendall(hdr + meta)  # Weiterleiten
             try:
-                # Zuerst 4 Byte Header einlesen
-                hdr = src.conn.recv(4)
-                if not hdr:
-                    break
-                if hdr == DISCONNECT_MSG[:4]:
-                    rest = src.conn.recv(len(DISCONNECT_MSG)-4)
-                    if hdr+rest == DISCONNECT_MSG:
-                        break
-                length = struct.unpack(">I", hdr)[0]
-                # Meta auslesen
-                meta = src.conn.recv(length)
-                dst.conn.sendall(hdr + meta)  # Weiterleiten
                 fname, fsize, ftype = meta.decode().split("|")
                 fsize = int(fsize)
-                # Datei-Daten weiterleiten
-                sent = 0
-                while sent < fsize:
-                    chunk = src.conn.recv(min(BUFFER_SIZE, fsize - sent))
-                    if not chunk:
-                        break
-                    dst.conn.sendall(chunk)
-                    sent += len(chunk)
             except:
-                break
+                fsize = 0
+
+            # Datei-Daten weiterleiten
+            transferred = 0
+            while transferred < fsize and src.alive and dst.alive:
+                chunk = src.conn.recv(min(BUFFER_SIZE, fsize - transferred))
+                if not chunk: break
+                dst.conn.sendall(chunk)
+                transferred += len(chunk)
     finally:
         log(f"{src.addr} disconnected")
         src.close()
         if dst.alive:
-            try:
-                dst.conn.sendall(DISCONNECT_MSG)
+            try: dst.conn.sendall(DISCONNECT_MSG)
             except: pass
             dst.close()
 
