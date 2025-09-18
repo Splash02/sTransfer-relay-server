@@ -2,138 +2,101 @@ import socket
 import threading
 import time
 
-HOST        = '0.0.0.0'
-PORT        = 5001
-CMD_JOIN    = b"JOIN\n"
-CMD_LEAVE   = b"LEAVE\n"
+HOST = "0.0.0.0"
+PORT = 5001
 BUFFER_SIZE = 4096
+DISCONNECT_MSG = b"__DISCONNECT__"
 
-waiting_list = []        # Liste der wartenden Sockets
-active_pairs = []        # Liste der aktuell gepaarten Adressen
+waiting = None      # maximal ein wartender Client
 lock = threading.Lock()
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
-def handle_client(conn, addr):
-    """
-    1) Liest JOIN oder schließt bei anderem
-    2) Fügt JOIN-Socket zur waiting_list hinzu
-    3) Startet monitor, um LEAVE vor Pairing zu erkennen
-    """
+class Client:
+    def __init__(self, conn, addr):
+        self.conn = conn
+        self.addr = addr
+        self.partner = None
+        self.alive = True
+
+    def close(self):
+        self.alive = False
+        try: self.conn.close()
+        except: pass
+
+def handle_client(client: Client):
+    global waiting
+    conn, addr = client.conn, client.addr
     try:
+        # Warte auf JOIN\n
         line = b""
         while not line.endswith(b"\n"):
             part = conn.recv(1)
             if not part:
-                conn.close()
+                client.close()
                 return
             line += part
-        if line != CMD_JOIN:
-            conn.close()
+
+        if line != b"JOIN\n":
+            client.close()
             return
 
+        log(f"{addr} requested JOIN")
+
         with lock:
-            waiting_list.append((conn, addr))
-        log(f"{addr} JOIN → added to waiting_list")
-
-        # Monitor-Thread, um LEAVE vor dem Pairing zu erfassen
-        threading.Thread(target=monitor_waiting, args=(conn, addr), daemon=True).start()
-
-    except Exception as e:
-        log(f"handle_client error {addr}: {e}")
-        conn.close()
-
-def monitor_waiting(conn, addr):
-    """
-    Wartet auf LEAVE oder Socket-Close, **vor** Pairing.
-    Entfernt den Client aus waiting_list.
-    """
-    try:
-        while True:
-            data = conn.recv(BUFFER_SIZE)
-            if not data or data == CMD_LEAVE:
-                with lock:
-                    # entferne alle Einträge mit dieser conn
-                    waiting_list[:] = [(c,a) for c,a in waiting_list if c is not conn]
-                log(f"{addr} LEAVE before pairing → removed from waiting_list")
-                conn.close()
-                return
-            # sonst ignorieren (z.B. Datei-Daten nach Pairing)
-    except:
-        with lock:
-            waiting_list[:] = [(c,a) for c,a in waiting_list if c is not conn]
-        log(f"{addr} disconnected before pairing")
-        try: conn.close()
-        except: pass
-
-def is_closed(conn):
-    try:
-        conn.settimeout(0.01)
-        _ = conn.recv(1, socket.MSG_PEEK)
-        conn.settimeout(None)
-        return False
-    except:
-        conn.settimeout(None)
-        return True
-
-def relay(src, dst, addr_src, addr_dst):
-    """
-    Relay-Loop: bricht bei LEAVE oder Verbindungsende ab.
-    """
-    try:
-        while True:
-            data = src.recv(BUFFER_SIZE)
-            if not data or data == CMD_LEAVE:
-                log(f"{addr_src} LEAVE during transfer")
-                break
-            dst.sendall(data)
-    except Exception as e:
-        log(f"Relay error {addr_src}->{addr_dst}: {e}")
-    finally:
-        cleanup(src, dst, addr_src, addr_dst)
-
-def cleanup(a, b, addr_a, addr_b):
-    for s in (a, b):
-        try: s.close()
-        except: pass
-    with lock:
-        active_pairs[:] = [p for p in active_pairs if addr_a not in p and addr_b not in p]
-    log(f"Cleaned up pair {addr_a} & {addr_b}")
-
-def matcher():
-    """
-    Polling-Matcher: sobald zwei wartende Sockets verfügbar,
-    werden sie gepaart.
-    """
-    while True:
-        with lock:
-            # Filter geschlossene Sockets heraus
-            waiting_list[:] = [(c,a) for c,a in waiting_list if not is_closed(c)]
-            if len(waiting_list) < 2:
-                # nichts zu tun
-                pass
+            global waiting
+            if waiting is None:
+                waiting = client
+                log(f"{addr} is waiting for partner...")
             else:
-                (c1,a1), (c2,a2) = waiting_list.pop(0), waiting_list.pop(0)
-                active_pairs.append((a1,a2))
-                log(f"Pairing {a1} <-> {a2}")
-                # Starte Relay in beide Richtungen
-                threading.Thread(target=relay, args=(c1,c2,a1,a2), daemon=True).start()
-                threading.Thread(target=relay, args=(c2,c1,a2,a1), daemon=True).start()
-        time.sleep(0.1)
+                partner = waiting
+                waiting = None
+                client.partner = partner
+                partner.partner = client
+                # Beide Clients miteinander verbinden
+                threading.Thread(target=relay, args=(client, partner), daemon=True).start()
+                threading.Thread(target=relay, args=(partner, client), daemon=True).start()
+                log(f"Paired {addr} <-> {partner.addr}")
+
+    except Exception as e:
+        log(f"Error handling {addr}: {e}")
+        client.close()
+        with lock:
+            if waiting is client:
+                waiting = None
+
+def relay(src: Client, dst: Client):
+    """Weiterleitung src -> dst"""
+    try:
+        while True:
+            data = src.conn.recv(BUFFER_SIZE)
+            if not data:
+                break
+            if data == DISCONNECT_MSG:
+                break
+            dst.conn.sendall(data)
+    except Exception as e:
+        log(f"Relay error {src.addr}->{dst.addr}: {e}")
+    finally:
+        log(f"{src.addr} disconnected")
+        src.close()
+        if dst.alive:
+            try: dst.conn.sendall(DISCONNECT_MSG)
+            except: pass
+            dst.close()
 
 def main():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen(10)
-    log(f"Relay listening on {HOST}:{PORT}")
-
-    threading.Thread(target=matcher, daemon=True).start()
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((HOST, PORT))
+    srv.listen(50)
+    log(f"Relay server listening on {HOST}:{PORT}")
 
     while True:
-        conn, addr = server.accept()
-        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+        conn, addr = srv.accept()
+        client = Client(conn, addr)
+        threading.Thread(target=handle_client, args=(client,), daemon=True).start()
 
 if __name__ == "__main__":
     main()
