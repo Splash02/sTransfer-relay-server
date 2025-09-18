@@ -7,7 +7,7 @@ PORT = 5001
 BUFFER_SIZE = 4096
 DISCONNECT_MSG = b"__DISCONNECT__"
 
-waiting = None      # maximal ein wartender Client
+waiting = None  # Maximal ein wartender Client
 lock = threading.Lock()
 
 def log(msg):
@@ -29,7 +29,7 @@ def handle_client(client: Client):
     global waiting
     conn, addr = client.conn, client.addr
     try:
-        # Warte auf JOIN\n
+        # Warte auf JOIN oder LEAVE
         line = b""
         while not line.endswith(b"\n"):
             part = conn.recv(1)
@@ -38,42 +38,47 @@ def handle_client(client: Client):
                 return
             line += part
 
-        if line != b"JOIN\n":
+        if line == b"JOIN\n":
+            log(f"{addr} joined")
+            with lock:
+                global waiting
+                if waiting is None:
+                    waiting = client
+                    log(f"{addr} wartet auf Partner...")
+                else:
+                    partner = waiting
+                    waiting = None
+                    client.partner = partner
+                    partner.partner = client
+                    # Beide Clients verbinden
+                    threading.Thread(target=relay, args=(client, partner), daemon=True).start()
+                    threading.Thread(target=relay, args=(partner, client), daemon=True).start()
+                    log(f"Paired {addr} <-> {partner.addr}")
+
+        elif line == b"LEAVE\n":
+            log(f"{addr} left before pairing")
             client.close()
-            return
+            with lock:
+                if waiting is client:
+                    waiting = None
 
-        log(f"{addr} requested JOIN")
-
-        with lock:
-            global waiting
-            if waiting is None:
-                waiting = client
-                log(f"{addr} is waiting for partner...")
-            else:
-                partner = waiting
-                waiting = None
-                client.partner = partner
-                partner.partner = client
-                # Beide Clients miteinander verbinden
-                threading.Thread(target=relay, args=(client, partner), daemon=True).start()
-                threading.Thread(target=relay, args=(partner, client), daemon=True).start()
-                log(f"Paired {addr} <-> {partner.addr}")
+        else:
+            log(f"{addr} sent unknown command: {line}")
+            client.close()
 
     except Exception as e:
-        log(f"Error handling {addr}: {e}")
+        log(f"Error {addr}: {e}")
         client.close()
         with lock:
             if waiting is client:
                 waiting = None
 
 def relay(src: Client, dst: Client):
-    """Weiterleitung src -> dst"""
+    """Leite Daten von src -> dst weiter"""
     try:
         while True:
             data = src.conn.recv(BUFFER_SIZE)
-            if not data:
-                break
-            if data == DISCONNECT_MSG:
+            if not data or data == DISCONNECT_MSG:
                 break
             dst.conn.sendall(data)
     except Exception as e:
