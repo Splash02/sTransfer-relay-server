@@ -1,5 +1,6 @@
 import socket
 import threading
+import struct
 import time
 
 HOST = "0.0.0.0"
@@ -8,7 +9,7 @@ BUFFER_SIZE = 4096
 DISCONNECT_MSG = b"__DISCONNECT__"
 
 lock = threading.Lock()
-waiting_clients = []  # Liste aller wartenden Clients
+waiting_clients = []
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}")
@@ -28,11 +29,9 @@ class Client:
             pass
 
 def monitor_waiting():
-    """Entfernt automatisch Clients aus waiting, die disconnected sind"""
-    global waiting_clients
     while True:
         with lock:
-            waiting_clients = [c for c in waiting_clients if c.alive]
+            waiting_clients[:] = [c for c in waiting_clients if c.alive]
         time.sleep(0.2)
 
 def handle_client(conn, addr):
@@ -54,20 +53,26 @@ def handle_client(conn, addr):
                 log(f"{addr} joined")
                 paired = False
                 with lock:
-                    # Prüfe, ob ein anderer wartender Client existiert
                     for waiting in waiting_clients:
                         if waiting.alive and waiting != client:
-                            # Pairing
                             client.partner = waiting
                             waiting.partner = client
                             waiting_clients.remove(waiting)
                             paired = True
+                            # Notify both clients
+                            try:
+                                client.conn.sendall(b"PAIRED\n")
+                                waiting.conn.sendall(b"PAIRED\n")
+                            except: pass
                             threading.Thread(target=relay, args=(client, waiting), daemon=True).start()
                             threading.Thread(target=relay, args=(waiting, client), daemon=True).start()
                             log(f"Paired {client.addr} <-> {waiting.addr}")
                             break
                     if not paired:
                         waiting_clients.append(client)
+                        try:
+                            client.conn.sendall(b"WAITING\n")
+                        except: pass
                         log(f"{client.addr} wartet auf Partner...")
             elif cmd == b"LEAVE":
                 log(f"{addr} left before pairing")
@@ -92,7 +97,6 @@ def handle_client(conn, addr):
                 waiting_clients.remove(client)
 
 def relay(src: Client, dst: Client):
-    """Leitet Daten von src -> dst weiter"""
     try:
         while src.alive and dst.alive:
             try:
