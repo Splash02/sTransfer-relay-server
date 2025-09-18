@@ -25,8 +25,7 @@ class Client:
         self.alive = False
         try:
             self.conn.close()
-        except:
-            pass
+        except: pass
 
 def monitor_waiting():
     while True:
@@ -100,13 +99,28 @@ def relay(src: Client, dst: Client):
     try:
         while src.alive and dst.alive:
             try:
-                data = src.conn.recv(BUFFER_SIZE)
-            except:
-                break
-            if not data or data == DISCONNECT_MSG:
-                break
-            try:
-                dst.conn.sendall(data)
+                # Zuerst 4 Byte Header einlesen
+                hdr = src.conn.recv(4)
+                if not hdr:
+                    break
+                if hdr == DISCONNECT_MSG[:4]:
+                    rest = src.conn.recv(len(DISCONNECT_MSG)-4)
+                    if hdr+rest == DISCONNECT_MSG:
+                        break
+                length = struct.unpack(">I", hdr)[0]
+                # Meta auslesen
+                meta = src.conn.recv(length)
+                dst.conn.sendall(hdr + meta)  # Weiterleiten
+                fname, fsize, ftype = meta.decode().split("|")
+                fsize = int(fsize)
+                # Datei-Daten weiterleiten
+                sent = 0
+                while sent < fsize:
+                    chunk = src.conn.recv(min(BUFFER_SIZE, fsize - sent))
+                    if not chunk:
+                        break
+                    dst.conn.sendall(chunk)
+                    sent += len(chunk)
             except:
                 break
     finally:
@@ -115,8 +129,7 @@ def relay(src: Client, dst: Client):
         if dst.alive:
             try:
                 dst.conn.sendall(DISCONNECT_MSG)
-            except:
-                pass
+            except: pass
             dst.close()
 
 def main():
