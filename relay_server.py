@@ -22,6 +22,14 @@ class RelayServer:
         client_id = f"{addr[0]}:{addr[1]}"
         print(f"[NEW CONNECTION] {client_id}")
         
+        # Optimize socket for large file transfers
+        try:
+            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)  # 1MB send buffer
+            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)  # 1MB recv buffer
+            client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # Disable Nagle
+        except:
+            pass  # Some systems may not support these options
+        
         try:
             with self.lock:
                 self.client_info[client_id] = {
