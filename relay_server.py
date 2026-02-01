@@ -40,7 +40,7 @@ def handle_client(conn, addr):
     log(f"New connection from {addr}")
     
     try:
-        conn.settimeout(1.0)
+        conn.settimeout(5.0)
         cmd = conn.recv(16).strip()
         
         if cmd != b"JOIN":
@@ -52,6 +52,10 @@ def handle_client(conn, addr):
         
         partner = None
         with lock:
+            waiting_clients_copy = [c for c in waiting_clients if c.alive]
+            waiting_clients.clear()
+            waiting_clients.extend(waiting_clients_copy)
+            
             if waiting_clients:
                 partner = waiting_clients.pop(0)
                 if not partner.alive:
@@ -85,9 +89,41 @@ def handle_client(conn, addr):
                         if client in waiting_clients:
                             waiting_clients.remove(client)
                     client.close()
+                    return
+                
+                wait_for_pair(client)
                     
     except Exception as e:
         log(f"Error handling {addr}: {e}")
+        client.close()
+        with lock:
+            if client in waiting_clients:
+                waiting_clients.remove(client)
+
+def wait_for_pair(client):
+    try:
+        client.conn.settimeout(0.5)
+        while client.alive and not client.paired:
+            try:
+                data = client.conn.recv(1)
+                if not data:
+                    log(f"{client.addr} disconnected while waiting")
+                    client.close()
+                    with lock:
+                        if client in waiting_clients:
+                            waiting_clients.remove(client)
+                    break
+            except socket.timeout:
+                continue
+            except:
+                log(f"{client.addr} connection error while waiting")
+                client.close()
+                with lock:
+                    if client in waiting_clients:
+                        waiting_clients.remove(client)
+                break
+    except Exception as e:
+        log(f"Error in wait_for_pair for {client.addr}: {e}")
         client.close()
         with lock:
             if client in waiting_clients:
@@ -130,12 +166,13 @@ def cleanup_pair(client1, client2):
 
 def cleanup_thread():
     while True:
-        time.sleep(2.0)
+        time.sleep(1.0)
         with lock:
-            dead_clients = [c for c in waiting_clients if not c.alive]
-            for c in dead_clients:
-                waiting_clients.remove(c)
-                log(f"Removed dead waiting client {c.addr}")
+            before_count = len(waiting_clients)
+            waiting_clients[:] = [c for c in waiting_clients if c.alive and not c.paired]
+            after_count = len(waiting_clients)
+            if before_count != after_count:
+                log(f"Cleaned up {before_count - after_count} dead/paired waiting clients")
 
 def main():
     threading.Thread(target=cleanup_thread, daemon=True).start()
