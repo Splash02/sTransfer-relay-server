@@ -52,13 +52,13 @@ def handle_client(conn, addr):
         
         partner = None
         with lock:
-            waiting_clients_copy = [c for c in waiting_clients if c.alive]
+            waiting_clients_copy = [c for c in waiting_clients if c.alive and not c.paired]
             waiting_clients.clear()
             waiting_clients.extend(waiting_clients_copy)
             
             if waiting_clients:
                 partner = waiting_clients.pop(0)
-                if not partner.alive:
+                if not partner.alive or partner.paired:
                     partner = None
                     
             if partner:
@@ -72,12 +72,13 @@ def handle_client(conn, addr):
                 try:
                     client.conn.sendall(b"PAIRED\n")
                     partner.conn.sendall(b"PAIRED\n")
-                except:
-                    log(f"Failed to notify pair {client.addr} <-> {partner.addr}")
+                except Exception as e:
+                    log(f"Failed to notify pair {client.addr} <-> {partner.addr}: {e}")
                     cleanup_pair(client, partner)
                     return
                     
                 threading.Thread(target=relay_bidirectional, args=(client, partner), daemon=True).start()
+                return
             else:
                 waiting_clients.append(client)
                 log(f"{addr} waiting for partner...")
@@ -91,7 +92,7 @@ def handle_client(conn, addr):
                     client.close()
                     return
                 
-                wait_for_pair(client)
+                wait_for_pair_or_disconnect(client)
                     
     except Exception as e:
         log(f"Error handling {addr}: {e}")
@@ -100,12 +101,12 @@ def handle_client(conn, addr):
             if client in waiting_clients:
                 waiting_clients.remove(client)
 
-def wait_for_pair(client):
+def wait_for_pair_or_disconnect(client):
     try:
         client.conn.settimeout(0.5)
         while client.alive and not client.paired:
             try:
-                data = client.conn.recv(1)
+                data = client.conn.recv(1, socket.MSG_PEEK)
                 if not data:
                     log(f"{client.addr} disconnected while waiting")
                     client.close()
@@ -113,17 +114,21 @@ def wait_for_pair(client):
                         if client in waiting_clients:
                             waiting_clients.remove(client)
                     break
+                
+                if client.paired:
+                    break
+                    
             except socket.timeout:
                 continue
-            except:
-                log(f"{client.addr} connection error while waiting")
+            except Exception as e:
+                log(f"{client.addr} connection error while waiting: {e}")
                 client.close()
                 with lock:
                     if client in waiting_clients:
                         waiting_clients.remove(client)
                 break
     except Exception as e:
-        log(f"Error in wait_for_pair for {client.addr}: {e}")
+        log(f"Error in wait_for_pair_or_disconnect for {client.addr}: {e}")
         client.close()
         with lock:
             if client in waiting_clients:
