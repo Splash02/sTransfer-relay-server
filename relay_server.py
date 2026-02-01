@@ -1,164 +1,187 @@
 import socket
 import threading
 import time
-import queue
+import struct
+import json
+from collections import deque
 
 HOST = "0.0.0.0"
 PORT = 5001
 BUFFER_SIZE = 65536
+HEARTBEAT_INTERVAL = 5
+HEARTBEAT_TIMEOUT = 15
 
-waiting_queue = queue.Queue()
-active_pairs = []
-lock = threading.Lock()
-
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}")
-
-class ClientConnection:
-    def __init__(self, conn, addr):
-        self.conn = conn
-        self.addr = addr
-        self.alive = True
+class RelayServer:
+    def __init__(self):
+        self.waiting_clients = deque()
+        self.matched_pairs = {}
+        self.client_info = {}
+        self.lock = threading.Lock()
         
-    def close(self):
-        if not self.alive:
-            return
-        self.alive = False
+    def handle_client(self, client_socket, addr):
+        client_id = f"{addr[0]}:{addr[1]}"
+        print(f"[NEW CONNECTION] {client_id}")
+        
         try:
-            self.conn.close()
-        except:
-            pass
-
-def handle_new_client(conn, addr):
-    client = ClientConnection(conn, addr)
-    log(f"New connection from {addr}")
-    
-    try:
-        conn.settimeout(3.0)
-        data = conn.recv(16).strip()
-        
-        if data != b"JOIN":
-            log(f"{addr} invalid command: {data}")
-            client.close()
-            return
-        
-        log(f"{addr} joining queue")
-        waiting_queue.put(client)
-        
-    except Exception as e:
-        log(f"Error with {addr}: {e}")
-        client.close()
-
-def matchmaker():
-    log("Matchmaker started")
-    while True:
-        try:
-            client1 = waiting_queue.get(timeout=1.0)
+            with self.lock:
+                self.client_info[client_id] = {
+                    'socket': client_socket,
+                    'addr': addr,
+                    'last_heartbeat': time.time(),
+                    'partner': None
+                }
             
-            if not client1.alive:
-                log(f"Skipping dead client {client1.addr}")
-                continue
+            client_socket.send(b"CONNECTED")
             
-            try:
-                client1.conn.sendall(b"WAITING\n")
-                log(f"{client1.addr} sent WAITING, looking for partner...")
-            except:
-                log(f"{client1.addr} failed to send WAITING")
-                client1.close()
-                continue
-            
-            client2 = None
-            while client2 is None:
+            while True:
                 try:
-                    potential = waiting_queue.get(timeout=0.1)
-                    if potential.alive and potential.addr != client1.addr:
-                        client2 = potential
-                    else:
-                        log(f"Skipping invalid partner candidate")
-                except queue.Empty:
-                    if not client1.alive:
-                        log(f"{client1.addr} died while waiting")
+                    client_socket.settimeout(1.0)
+                    data = client_socket.recv(1024)
+                    
+                    if not data:
                         break
+                    
+                    message = data.decode('utf-8').strip()
+                    
+                    if message == "JOIN":
+                        self.handle_join(client_id)
+                    elif message == "HEARTBEAT":
+                        with self.lock:
+                            if client_id in self.client_info:
+                                self.client_info[client_id]['last_heartbeat'] = time.time()
+                        client_socket.send(b"HEARTBEAT_ACK")
+                    elif message == "LEAVE":
+                        break
+                    elif message.startswith("RELAY:"):
+                        self.relay_data(client_id, data)
+                        
+                except socket.timeout:
                     continue
-            
-            if client2 is None:
-                client1.close()
-                continue
-            
-            log(f"Pairing {client1.addr} <-> {client2.addr}")
-            
-            try:
-                client1.conn.sendall(b"PAIRED\n")
-                client2.conn.sendall(b"PAIRED\n")
-            except Exception as e:
-                log(f"Failed to notify pair: {e}")
-                client1.close()
-                client2.close()
-                continue
-            
-            with lock:
-                active_pairs.append((client1, client2))
-            
-            t1 = threading.Thread(target=relay_data, args=(client1, client2), daemon=True)
-            t2 = threading.Thread(target=relay_data, args=(client2, client1), daemon=True)
-            t1.start()
-            t2.start()
-            
-        except queue.Empty:
-            continue
-        except Exception as e:
-            log(f"Matchmaker error: {e}")
-
-def relay_data(src, dst):
-    try:
-        src.conn.settimeout(None)
-        while src.alive and dst.alive:
-            try:
-                data = src.conn.recv(BUFFER_SIZE)
-                if not data:
+                except Exception as e:
+                    print(f"[ERROR] {client_id}: {e}")
                     break
-                dst.conn.sendall(data)
-            except Exception as e:
-                break
-    except Exception as e:
-        pass
-    finally:
-        log(f"Relay ended: {src.addr} -> {dst.addr}")
-        src.close()
-        dst.close()
-        with lock:
-            try:
-                active_pairs.remove((src, dst))
-            except:
-                pass
-            try:
-                active_pairs.remove((dst, src))
-            except:
-                pass
-
-def cleanup_dead_connections():
-    while True:
-        time.sleep(5.0)
-        with lock:
-            count = len(active_pairs)
-            log(f"Active pairs: {count}")
-
-def main():
-    threading.Thread(target=matchmaker, daemon=True).start()
-    threading.Thread(target=cleanup_dead_connections, daemon=True).start()
-    
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen(100)
-    log(f"Relay server listening on {HOST}:{PORT}")
-    
-    while True:
-        try:
-            conn, addr = server.accept()
-            threading.Thread(target=handle_new_client, args=(conn, addr), daemon=True).start()
+                    
         except Exception as e:
-            log(f"Accept error: {e}")
+            print(f"[ERROR] Connection error for {client_id}: {e}")
+        finally:
+            self.disconnect_client(client_id)
+            
+    def handle_join(self, client_id):
+        with self.lock:
+            if client_id not in self.client_info:
+                return
+                
+            if self.waiting_clients:
+                partner_id = self.waiting_clients.popleft()
+                
+                if partner_id in self.client_info:
+                    self.matched_pairs[client_id] = partner_id
+                    self.matched_pairs[partner_id] = client_id
+                    
+                    self.client_info[client_id]['partner'] = partner_id
+                    self.client_info[partner_id]['partner'] = client_id
+                    
+                    try:
+                        partner_socket = self.client_info[partner_id]['socket']
+                        client_socket = self.client_info[client_id]['socket']
+                        
+                        partner_socket.send(b"MATCHED")
+                        client_socket.send(b"MATCHED")
+                        
+                        print(f"[MATCHED] {client_id} <-> {partner_id}")
+                    except Exception as e:
+                        print(f"[ERROR] Failed to notify match: {e}")
+                        self.disconnect_client(client_id)
+                        self.disconnect_client(partner_id)
+                else:
+                    self.waiting_clients.append(client_id)
+                    self.client_info[client_id]['socket'].send(b"WAITING")
+                    print(f"[WAITING] {client_id}")
+            else:
+                self.waiting_clients.append(client_id)
+                self.client_info[client_id]['socket'].send(b"WAITING")
+                print(f"[WAITING] {client_id}")
+                
+    def relay_data(self, sender_id, data):
+        with self.lock:
+            if sender_id in self.matched_pairs:
+                partner_id = self.matched_pairs[sender_id]
+                if partner_id in self.client_info:
+                    try:
+                        partner_socket = self.client_info[partner_id]['socket']
+                        partner_socket.send(data)
+                    except Exception as e:
+                        print(f"[ERROR] Failed to relay data: {e}")
+                        self.disconnect_client(sender_id)
+                        self.disconnect_client(partner_id)
+                        
+    def disconnect_client(self, client_id):
+        with self.lock:
+            if client_id in self.client_info:
+                partner_id = self.client_info[client_id].get('partner')
+                
+                try:
+                    self.client_info[client_id]['socket'].close()
+                except:
+                    pass
+                
+                del self.client_info[client_id]
+                
+                if partner_id and partner_id in self.client_info:
+                    try:
+                        self.client_info[partner_id]['socket'].send(b"PARTNER_DISCONNECTED")
+                        self.client_info[partner_id]['partner'] = None
+                    except:
+                        pass
+                    
+                    if partner_id in self.matched_pairs:
+                        del self.matched_pairs[partner_id]
+                        
+                if client_id in self.matched_pairs:
+                    del self.matched_pairs[client_id]
+                    
+                if client_id in self.waiting_clients:
+                    self.waiting_clients.remove(client_id)
+                    
+                print(f"[DISCONNECTED] {client_id}")
+                
+    def check_heartbeats(self):
+        while True:
+            time.sleep(HEARTBEAT_INTERVAL)
+            current_time = time.time()
+            
+            with self.lock:
+                disconnected = []
+                for client_id, info in list(self.client_info.items()):
+                    if current_time - info['last_heartbeat'] > HEARTBEAT_TIMEOUT:
+                        disconnected.append(client_id)
+                        
+            for client_id in disconnected:
+                print(f"[TIMEOUT] {client_id}")
+                self.disconnect_client(client_id)
+                
+    def start(self):
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind((HOST, PORT))
+        server_socket.listen(5)
+        
+        print(f"[STARTED] Relay server listening on {HOST}:{PORT}")
+        
+        heartbeat_thread = threading.Thread(target=self.check_heartbeats, daemon=True)
+        heartbeat_thread.start()
+        
+        try:
+            while True:
+                client_socket, addr = server_socket.accept()
+                thread = threading.Thread(target=self.handle_client, args=(client_socket, addr))
+                thread.daemon = True
+                thread.start()
+        except KeyboardInterrupt:
+            print("\n[SHUTDOWN] Server shutting down...")
+        finally:
+            server_socket.close()
 
 if __name__ == "__main__":
-    main()
+    server = RelayServer()
+    server.start()
