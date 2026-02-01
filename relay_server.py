@@ -36,24 +36,45 @@ class RelayServer:
             while True:
                 try:
                     client_socket.settimeout(1.0)
-                    data = client_socket.recv(1024)
+                    data = client_socket.recv(BUFFER_SIZE)
                     
                     if not data:
                         break
                     
-                    message = data.decode('utf-8').strip()
+                    # Check if this is a text command or binary data
+                    # Text commands: JOIN, HEARTBEAT, LEAVE, FILE:...
+                    # Binary data: file chunks with length prefix
                     
-                    if message == "JOIN":
-                        self.handle_join(client_id)
-                    elif message == "HEARTBEAT":
-                        with self.lock:
-                            if client_id in self.client_info:
-                                self.client_info[client_id]['last_heartbeat'] = time.time()
-                        client_socket.send(b"HEARTBEAT_ACK")
-                    elif message == "LEAVE":
-                        break
-                    elif message.startswith("RELAY:"):
+                    is_matched = False
+                    with self.lock:
+                        is_matched = client_id in self.matched_pairs
+                    
+                    if is_matched and (data[:4] == struct.pack('!I', len(data)-4) or b'\n' not in data[:100] and len(data) > 100):
+                        # This looks like binary file data (length-prefixed chunk)
                         self.relay_data(client_id, data)
+                    else:
+                        # Try to decode as text command
+                        try:
+                            message = data.decode('utf-8', errors='ignore').strip()
+                            
+                            if message == "JOIN":
+                                self.handle_join(client_id)
+                            elif message == "HEARTBEAT":
+                                with self.lock:
+                                    if client_id in self.client_info:
+                                        self.client_info[client_id]['last_heartbeat'] = time.time()
+                                client_socket.send(b"HEARTBEAT_ACK")
+                            elif message == "LEAVE":
+                                break
+                            elif message.startswith("FILE:") or b"FILE:" in data:
+                                # File header - forward to partner
+                                self.relay_data(client_id, data)
+                            elif len(data) >= 4:
+                                # Could be binary chunk, forward it
+                                self.relay_data(client_id, data)
+                        except:
+                            # If decode fails, it's binary data
+                            self.relay_data(client_id, data)
                         
                 except socket.timeout:
                     continue
