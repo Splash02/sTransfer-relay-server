@@ -1,197 +1,162 @@
 import socket
 import threading
 import time
-import struct
+import queue
 
 HOST = "0.0.0.0"
 PORT = 5001
 BUFFER_SIZE = 65536
 
-lock = threading.Lock()
-waiting_clients = []
+waiting_queue = queue.Queue()
 active_pairs = []
+lock = threading.Lock()
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
-class Client:
+class ClientConnection:
     def __init__(self, conn, addr):
         self.conn = conn
         self.addr = addr
-        self.partner = None
         self.alive = True
-        self.paired = False
         
     def close(self):
         if not self.alive:
             return
         self.alive = False
         try:
-            self.conn.shutdown(socket.SHUT_RDWR)
-        except:
-            pass
-        try:
             self.conn.close()
         except:
             pass
 
-def handle_client(conn, addr):
-    client = Client(conn, addr)
+def handle_new_client(conn, addr):
+    client = ClientConnection(conn, addr)
     log(f"New connection from {addr}")
     
     try:
-        conn.settimeout(5.0)
-        cmd = conn.recv(16).strip()
+        conn.settimeout(3.0)
+        data = conn.recv(16).strip()
         
-        if cmd != b"JOIN":
-            log(f"{addr} sent invalid command: {cmd}")
+        if data != b"JOIN":
+            log(f"{addr} invalid command: {data}")
             client.close()
             return
-            
-        log(f"{addr} requested to join")
         
-        partner = None
-        with lock:
-            waiting_clients_copy = [c for c in waiting_clients if c.alive and not c.paired]
-            waiting_clients.clear()
-            waiting_clients.extend(waiting_clients_copy)
-            
-            if waiting_clients:
-                partner = waiting_clients.pop(0)
-                if not partner.alive or partner.paired:
-                    partner = None
-                    
-            if partner:
-                client.partner = partner
-                partner.partner = client
-                client.paired = True
-                partner.paired = True
-                active_pairs.append((client, partner))
-                log(f"Paired {client.addr} <-> {partner.addr}")
-                
-                try:
-                    client.conn.sendall(b"PAIRED\n")
-                    partner.conn.sendall(b"PAIRED\n")
-                except Exception as e:
-                    log(f"Failed to notify pair {client.addr} <-> {partner.addr}: {e}")
-                    cleanup_pair(client, partner)
-                    return
-                    
-                threading.Thread(target=relay_bidirectional, args=(client, partner), daemon=True).start()
-                return
-            else:
-                waiting_clients.append(client)
-                log(f"{addr} waiting for partner...")
-                try:
-                    client.conn.sendall(b"WAITING\n")
-                except:
-                    log(f"Failed to notify {addr} of waiting status")
-                    with lock:
-                        if client in waiting_clients:
-                            waiting_clients.remove(client)
-                    client.close()
-                    return
-                
-                wait_for_pair_or_disconnect(client)
-                    
+        log(f"{addr} joining queue")
+        waiting_queue.put(client)
+        
     except Exception as e:
-        log(f"Error handling {addr}: {e}")
+        log(f"Error with {addr}: {e}")
         client.close()
-        with lock:
-            if client in waiting_clients:
-                waiting_clients.remove(client)
 
-def wait_for_pair_or_disconnect(client):
-    try:
-        client.conn.settimeout(0.5)
-        while client.alive and not client.paired:
-            try:
-                data = client.conn.recv(1, socket.MSG_PEEK)
-                if not data:
-                    log(f"{client.addr} disconnected while waiting")
-                    client.close()
-                    with lock:
-                        if client in waiting_clients:
-                            waiting_clients.remove(client)
-                    break
-                
-                if client.paired:
-                    break
-                    
-            except socket.timeout:
+def matchmaker():
+    log("Matchmaker started")
+    while True:
+        try:
+            client1 = waiting_queue.get(timeout=1.0)
+            
+            if not client1.alive:
+                log(f"Skipping dead client {client1.addr}")
                 continue
+            
+            try:
+                client1.conn.sendall(b"WAITING\n")
+                log(f"{client1.addr} sent WAITING, looking for partner...")
+            except:
+                log(f"{client1.addr} failed to send WAITING")
+                client1.close()
+                continue
+            
+            client2 = None
+            while client2 is None:
+                try:
+                    potential = waiting_queue.get(timeout=0.1)
+                    if potential.alive and potential.addr != client1.addr:
+                        client2 = potential
+                    else:
+                        log(f"Skipping invalid partner candidate")
+                except queue.Empty:
+                    if not client1.alive:
+                        log(f"{client1.addr} died while waiting")
+                        break
+                    continue
+            
+            if client2 is None:
+                client1.close()
+                continue
+            
+            log(f"Pairing {client1.addr} <-> {client2.addr}")
+            
+            try:
+                client1.conn.sendall(b"PAIRED\n")
+                client2.conn.sendall(b"PAIRED\n")
             except Exception as e:
-                log(f"{client.addr} connection error while waiting: {e}")
-                client.close()
-                with lock:
-                    if client in waiting_clients:
-                        waiting_clients.remove(client)
+                log(f"Failed to notify pair: {e}")
+                client1.close()
+                client2.close()
+                continue
+            
+            with lock:
+                active_pairs.append((client1, client2))
+            
+            t1 = threading.Thread(target=relay_data, args=(client1, client2), daemon=True)
+            t2 = threading.Thread(target=relay_data, args=(client2, client1), daemon=True)
+            t1.start()
+            t2.start()
+            
+        except queue.Empty:
+            continue
+        except Exception as e:
+            log(f"Matchmaker error: {e}")
+
+def relay_data(src, dst):
+    try:
+        src.conn.settimeout(None)
+        while src.alive and dst.alive:
+            try:
+                data = src.conn.recv(BUFFER_SIZE)
+                if not data:
+                    break
+                dst.conn.sendall(data)
+            except Exception as e:
                 break
     except Exception as e:
-        log(f"Error in wait_for_pair_or_disconnect for {client.addr}: {e}")
-        client.close()
+        pass
+    finally:
+        log(f"Relay ended: {src.addr} -> {dst.addr}")
+        src.close()
+        dst.close()
         with lock:
-            if client in waiting_clients:
-                waiting_clients.remove(client)
+            try:
+                active_pairs.remove((src, dst))
+            except:
+                pass
+            try:
+                active_pairs.remove((dst, src))
+            except:
+                pass
 
-def relay_bidirectional(client1, client2):
-    def relay_one_way(src, dst):
-        try:
-            src.conn.settimeout(None)
-            while src.alive and dst.alive:
-                try:
-                    data = src.conn.recv(BUFFER_SIZE)
-                    if not data:
-                        break
-                    dst.conn.sendall(data)
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    break
-        except Exception as e:
-            pass
-        finally:
-            cleanup_pair(src, dst)
-    
-    t1 = threading.Thread(target=relay_one_way, args=(client1, client2), daemon=True)
-    t2 = threading.Thread(target=relay_one_way, args=(client2, client1), daemon=True)
-    t1.start()
-    t2.start()
-
-def cleanup_pair(client1, client2):
-    with lock:
-        if (client1, client2) in active_pairs:
-            active_pairs.remove((client1, client2))
-        if (client2, client1) in active_pairs:
-            active_pairs.remove((client2, client1))
-    
-    log(f"Cleaning up pair {client1.addr} <-> {client2.addr}")
-    client1.close()
-    client2.close()
-
-def cleanup_thread():
+def cleanup_dead_connections():
     while True:
-        time.sleep(1.0)
+        time.sleep(5.0)
         with lock:
-            before_count = len(waiting_clients)
-            waiting_clients[:] = [c for c in waiting_clients if c.alive and not c.paired]
-            after_count = len(waiting_clients)
-            if before_count != after_count:
-                log(f"Cleaned up {before_count - after_count} dead/paired waiting clients")
+            count = len(active_pairs)
+            log(f"Active pairs: {count}")
 
 def main():
-    threading.Thread(target=cleanup_thread, daemon=True).start()
+    threading.Thread(target=matchmaker, daemon=True).start()
+    threading.Thread(target=cleanup_dead_connections, daemon=True).start()
     
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((HOST, PORT))
-    srv.listen(100)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen(100)
     log(f"Relay server listening on {HOST}:{PORT}")
     
     while True:
         try:
-            conn, addr = srv.accept()
-            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+            conn, addr = server.accept()
+            threading.Thread(target=handle_new_client, args=(conn, addr), daemon=True).start()
         except Exception as e:
             log(f"Accept error: {e}")
 
